@@ -1,4 +1,4 @@
-module T-Mind
+module github.com/jacoblai/template
 
 go 1.23
 

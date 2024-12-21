@@ -1,11 +1,11 @@
 package main
 
 import (
-	"T-Mind/mschema"
 	"context"
 	"encoding/json"
 	"fmt"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/jacoblai/template/mschema"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
