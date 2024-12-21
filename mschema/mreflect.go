@@ -19,7 +19,6 @@ var Version = "http://json-schema.org/draft-04/schema#"
 // RFC draft-wright-json-schema-00, section 4.5
 type Schema struct {
 	*Type
-	Definitions Definitions `json:"definitions,omitempty"`
 }
 
 // Type represents a JSON Schema object type.
@@ -102,28 +101,20 @@ func (r *Reflector) Reflect(v interface{}) *Schema {
 
 // ReflectFromType generates root schema
 func (r *Reflector) ReflectFromType(t reflect.Type) *Schema {
-	definitions := Definitions{}
-	if r.ExpandedStruct {
-		st := &Type{
-			//Version:              Version,
-			Type:                 "object",
-			Properties:           map[string]*Type{},
-			AdditionalProperties: []byte("false"),
-		}
-		if r.AllowAdditionalProperties {
-			st.AdditionalProperties = []byte("true")
-		}
-		r.reflectStructFields(st, definitions, t)
-		r.reflectStruct(definitions, t)
-		delete(definitions, t.Name())
-		return &Schema{Type: st, Definitions: definitions}
+	// 创建一个新的根 schema 对象
+	st := &Type{
+		Type:                 "object",
+		Properties:           map[string]*Type{},
+		AdditionalProperties: []byte("true"), // MongoDB 默认允许额外字段
 	}
 
-	s := &Schema{
-		Type:        r.reflectTypeToSchema(definitions, t),
-		Definitions: definitions,
+	// 直接处理字段,而不是使用引用
+	r.reflectStructFields(st, nil, t)
+
+	// 包装并返回 schema
+	return &Schema{
+		Type: st,
 	}
-	return s
 }
 
 // Definitions hold schema definitions.
@@ -149,67 +140,53 @@ type protoEnum interface {
 
 var protoEnumType = reflect.TypeOf((*protoEnum)(nil)).Elem()
 
+// reflectTypeToSchema 转换 Go 类型到 MongoDB schema 类型
 func (r *Reflector) reflectTypeToSchema(definitions Definitions, t reflect.Type) *Type {
-	// Already added to definitions?
-	if _, ok := definitions[t.Name()]; ok {
-		return &Type{Ref: "#/definitions/" + t.Name()}
-	}
-
-	// jsonpb will marshal protobuf enum options as either strings or integers.
-	// It will unmarshal either.
-	if t.Implements(protoEnumType) {
-		return &Type{OneOf: []*Type{
-			{Type: "string"},
-			{Type: "integer"},
-		}}
-	}
-
-	// Defined format types for JSON Schema Validation
-	// RFC draft-wright-json-schema-validation-00, section 7.3
-	// TODO email RFC section 7.3.2, hostname RFC section 7.3.3, uriref RFC section 7.3.7
-	switch t {
-	case ipType:
-		// TODO differentiate ipv4 and ipv6 RFC section 7.3.4, 7.3.5
-		return &Type{Type: "string", Format: "ipv4"} // ipv4 RFC section 7.3.4
-	}
-
 	switch t.Kind() {
 	case reflect.Struct:
-
 		switch t {
-		case timeType: // date-time RFC section 7.3.1
-			//return &Type{Type: "string", Format: "date-time"}
+		case timeType:
 			return &Type{Type: "date"}
-		case uriType: // uri RFC section 7.3.6
+		case uriType:
 			return &Type{Type: "string", Format: "uri"}
 		default:
-			return r.reflectStruct(definitions, t)
+			// 直接展开结构体
+			st := &Type{
+				Type:                 "object",
+				Properties:           map[string]*Type{},
+				AdditionalProperties: []byte("true"),
+			}
+			r.reflectStructFields(st, definitions, t)
+			return st
 		}
-
-	case reflect.Array:
-		return &Type{Type: "objectId"}
 
 	case reflect.Map:
-		rt := &Type{
-			Type: "object",
-			PatternProperties: map[string]*Type{
-				".*": r.reflectTypeToSchema(definitions, t.Elem()),
-			},
+		return &Type{
+			Type:                 "object",
+			AdditionalProperties: []byte("true"),
 		}
-		delete(rt.PatternProperties, "additionalProperties")
-		return rt
 
 	case reflect.Slice:
 		switch t {
 		case byteSliceType:
-			return &Type{
-				Type:  "string",
-				Media: &Type{BinaryEncoding: "base64"},
-			}
+			return &Type{Type: "binData"}
 		default:
+			// 如果数组元素是结构体，直接内联展开
+			elemType := t.Elem()
+			if elemType.Kind() == reflect.Struct && elemType != timeType && elemType != uriType {
+				return &Type{
+					Type: "array",
+					Items: &Type{
+						Type:                 "object",
+						Properties:           map[string]*Type{},
+						AdditionalProperties: []byte("true"),
+						Required:             []string{},
+					},
+				}
+			}
 			return &Type{
 				Type:  "array",
-				Items: r.reflectTypeToSchema(definitions, t.Elem()),
+				Items: r.reflectTypeToSchema(definitions, elemType),
 			}
 		}
 
@@ -240,8 +217,22 @@ func (r *Reflector) reflectTypeToSchema(definitions Definitions, t reflect.Type)
 
 	case reflect.Ptr:
 		return r.reflectTypeToSchema(definitions, t.Elem())
+
+	case reflect.Array:
+		if t == reflect.TypeOf([12]byte{}) {
+			return &Type{Type: "objectId"}
+		}
+		return &Type{
+			Type:  "array",
+			Items: r.reflectTypeToSchema(definitions, t.Elem()),
+		}
 	}
-	panic("unsupported type " + t.String())
+
+	// 默认作为对象处理
+	return &Type{
+		Type:                 "object",
+		AdditionalProperties: []byte("true"),
+	}
 }
 
 // Refects a struct to a JSON Schema type.
@@ -249,40 +240,47 @@ func (r *Reflector) reflectStruct(definitions Definitions, t reflect.Type) *Type
 	st := &Type{
 		Type:                 "object",
 		Properties:           map[string]*Type{},
-		AdditionalProperties: []byte("false"),
+		AdditionalProperties: []byte("true"), // MongoDB 默认允许额外字段
 	}
-	if r.AllowAdditionalProperties {
-		st.AdditionalProperties = []byte("true")
-	}
-	definitions[t.Name()] = st
-	r.reflectStructFields(st, definitions, t)
 
-	return &Type{
-		//Version: Version,
-		Ref: "#/definitions/" + t.Name(),
-	}
+	// 直接内联字段，不使用引用
+	r.reflectStructFields(st, definitions, t)
+	return st
 }
 
+// reflectStructFields 递归处理结构体字段
 func (r *Reflector) reflectStructFields(st *Type, definitions Definitions, t reflect.Type) {
+	// 处理指针类型
 	if t.Kind() == reflect.Ptr {
 		t = t.Elem()
 	}
+
+	// 遍历所有字段
 	for i := 0; i < t.NumField(); i++ {
 		f := t.Field(i)
-		// anonymous and exported type should be processed recursively
-		// current type should inherit properties of anonymous one
+
+		// 处理匿名嵌入字段
 		if f.Anonymous && f.PkgPath == "" {
 			r.reflectStructFields(st, definitions, f.Type)
 			continue
 		}
 
+		// 获取字段名和是否必需
 		name, required := r.reflectFieldName(f)
 		if name == "" {
 			continue
 		}
+
+		// 获取字段的类型 schema
 		property := r.reflectTypeToSchema(definitions, f.Type)
+
+		// 处理字段的标签
 		property.structKeywordsFromTags(f)
+
+		// 添加到属性映射
 		st.Properties[name] = property
+
+		// 如果是必需字段,添加到必需列表
 		if required {
 			st.Required = append(st.Required, name)
 		}
@@ -442,13 +440,13 @@ func ignoredByJSONSchemaTags(tags []string) bool {
 	return tags[0] == "-"
 }
 
+// reflectFieldName 获取字段的 JSON 名称和是否必需
 func (r *Reflector) reflectFieldName(f reflect.StructField) (string, bool) {
-	if f.PkgPath != "" { // unexported field, ignore it
+	if f.PkgPath != "" { // 未导出字段
 		return "", false
 	}
 
 	jsonTags := strings.Split(f.Tag.Get("json"), ",")
-
 	if ignoredByJSONTags(jsonTags) {
 		return "", false
 	}
