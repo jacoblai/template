@@ -111,9 +111,28 @@ func (r *Reflector) ReflectFromType(t reflect.Type) *Schema {
 	// 直接处理字段,而不是使用引用
 	r.reflectStructFields(st, nil, t)
 
+	// MongoDB特定处理：处理id/_id问题
+	r.fixMongoIssues(st)
+
 	// 包装并返回 schema
 	return &Schema{
 		Type: st,
+	}
+}
+
+// fixMongoIssues 处理MongoDB特定的问题，例如id和_id的映射关系
+func (r *Reflector) fixMongoIssues(st *Type) {
+	// 如果存在id属性，将其转为_id属性
+	if idProp, exists := st.Properties["id"]; exists {
+		st.Properties["_id"] = idProp
+		delete(st.Properties, "id")
+	}
+
+	// 在required列表中，将id替换为_id
+	for i, field := range st.Required {
+		if field == "id" {
+			st.Required[i] = "_id"
+		}
 	}
 }
 
@@ -142,6 +161,11 @@ var protoEnumType = reflect.TypeOf((*protoEnum)(nil)).Elem()
 
 // reflectTypeToSchema 转换 Go 类型到 MongoDB schema 类型
 func (r *Reflector) reflectTypeToSchema(definitions Definitions, t reflect.Type) *Type {
+	// 添加对primitive.ObjectID类型的直接支持
+	if t.String() == "primitive.ObjectID" {
+		return &Type{Type: "objectId"}
+	}
+
 	switch t.Kind() {
 	case reflect.Struct:
 		switch t {
@@ -289,6 +313,15 @@ func (r *Reflector) reflectStructFields(st *Type, definitions Definitions, t ref
 
 func (t *Type) structKeywordsFromTags(f reflect.StructField) {
 	tags := strings.Split(f.Tag.Get("jsonschema"), ",")
+
+	// 首先检查是否有oid标记，这比类型检查优先级更高
+	for _, tag := range tags {
+		if tag == "oid" {
+			t.Type = "objectId"
+			return // 一旦设置为objectId，就不需要继续处理其他类型相关的标签
+		}
+	}
+
 	switch t.Type {
 	case "string":
 		t.stringKeywords(tags)
@@ -332,9 +365,6 @@ func (t *Type) stringKeywords(tags []string) {
 			case "description":
 				t.Description = val
 			}
-		}
-		if tag == "oid" {
-			t.Type = "objectId"
 		}
 	}
 }
@@ -463,8 +493,18 @@ func (r *Reflector) reflectFieldName(f reflect.StructField) (string, bool) {
 		required = requiredFromJSONSchemaTags(jsonSchemaTags)
 	}
 
+	// 首先从JSON标签获取名称
 	if jsonTags[0] != "" {
 		name = jsonTags[0]
+	}
+
+	// 从BSON标签处理_id映射
+	bsonTags := strings.Split(f.Tag.Get("bson"), ",")
+	if len(bsonTags) > 0 && bsonTags[0] == "_id" {
+		// 如果BSON标签是_id，确保在Schema中使用id
+		if name == "_id" {
+			name = "id"
+		}
 	}
 
 	return name, required
